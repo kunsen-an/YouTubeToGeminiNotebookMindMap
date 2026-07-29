@@ -1,0 +1,7 @@
+{
+  "name": "youtube-to-gemini-notebook-mind-map",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}
