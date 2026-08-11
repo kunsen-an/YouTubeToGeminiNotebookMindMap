@@ -1404,11 +1404,11 @@ function isExactYouTubeSourceVisible(video) {
 
   const panelText = normalize(sourcePanel.textContent);
   const videoId = new URL(video.url).searchParams.get("v") || "";
-  const title = sourceMatchTitle(video);
+  const titleKey = sourceTitleMatchKey(sourceMatchTitle(video));
 
   return Boolean(
     (videoId && panelText.includes(videoId.toLowerCase())) ||
-    (title.length >= 12 && panelText.includes(title.slice(0, 24)))
+    (titleKey && panelText.includes(titleKey))
   );
 }
 
@@ -1481,10 +1481,15 @@ function findSelectAllSourcesControl() {
 }
 
 function sourceSelectionMatchesVideo(entry, videoId, title) {
+  const titleKey = sourceTitleMatchKey(title);
   return (
     (videoId && entry.text.includes(videoId)) ||
-    (title.length >= 12 && entry.text.includes(title.slice(0, 24)))
+    (titleKey && entry.text.includes(titleKey))
   );
+}
+
+function sourceTitleMatchKey(title) {
+  return normalize(title).slice(0, 24);
 }
 
 function findProcessedVideoSourceEntry(videoId, title) {
@@ -1504,10 +1509,8 @@ function findProcessedVideoSourceEntry(videoId, title) {
 
   // 新規追加直後のURLだけの一時行ではなく、動画タイトルへ解決された
   // 操作可能な正式ソース行になったことを完了状態として使用する。
-  if (
-    title.length >= 12 &&
-    !entry.text.includes(title.slice(0, 24))
-  ) {
+  const titleKey = sourceTitleMatchKey(title);
+  if (titleKey && !entry.text.includes(titleKey)) {
     return null;
   }
 
@@ -1763,10 +1766,11 @@ async function selectOnlyVideoSource(video) {
   }
 
   const selectedText = selected[0].text;
+  const titleKey = sourceTitleMatchKey(title);
   if (
     !(
       (videoId && selectedText.includes(videoId)) ||
-      (title.length >= 12 && selectedText.includes(title.slice(0, 24)))
+      (titleKey && selectedText.includes(titleKey))
     )
   ) {
     throw new Error(

@@ -591,6 +591,41 @@ test("正式ソース行のチェックボックスにaria-labelがなくても�
   });
 });
 
+test("12文字未満の動画タイトルでも正式ソース行として検出する", () => {
+  const context = createContext();
+  const target = "債券市場で緊急警告！";
+  const stable = createSourceEntry(target, true, "short-title");
+
+  context.findSourceSelectionItems = () => [stable];
+
+  const matched = context.findProcessedVideoSourceEntry(
+    "2c35ygtupva",
+    context.normalize(target)
+  );
+
+  assert.equal(matched, stable);
+});
+
+test("12文字未満のタイトルでも対象ソースだけを選択する", async () => {
+  const context = createContext();
+  const target = "債券市場で緊急警告！";
+  const fixture = installSourceFixture(
+    context,
+    ["既存動画A", target, "既存動画B"],
+    target
+  );
+
+  await context.selectOnlyVideoSource({
+    url: "https://www.youtube.com/watch?v=2c35ygtupva",
+    title: target
+  });
+
+  assert.deepEqual(
+    fixture.entries.map((entry) => entry.input.checked),
+    [false, true, false]
+  );
+});
+
 test("画面外に既存ソースがある場合は再追加せず選択へ進む", async () => {
   const context = createContext();
   const target = "画面外の既存動画タイトル 1234567890";
