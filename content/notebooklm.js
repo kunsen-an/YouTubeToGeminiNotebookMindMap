@@ -1,19 +1,27 @@
 const DEBUG_PREFIX = "[YT2NLM]";
 const NOTEBOOK_HOME_URL = "https://notebook.google.com/";
-const NOTEBOOK_CONTENT_VERSION = "2026-07-29-gemini-notebook-v40";
+const NOTEBOOK_CONTENT_VERSION = "2026-09-22-gemini-notebook-v57";
 const PENDING_NOTEBOOK_CREATION_KEY = "pendingNotebookCreationName";
 const JAPANESE_MIND_MAP_INSTRUCTION =
   "動画の内容を日本語で整理し、マインドマップ全体を日本語で作成してください。";
+let debugStoreQueue = Promise.resolve();
+let flowRunning = false;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "NLM_PING") {
-    sendResponse({ ok: true, version: NOTEBOOK_CONTENT_VERSION });
+    sendResponse({ ok: true, version: NOTEBOOK_CONTENT_VERSION, running: flowRunning });
     return true;
   }
 
   if (message?.type !== "NLM_RUN_FLOW") return false;
+  if (flowRunning) {
+    sendResponse({ ok: false, busy: true, error: "別の動画を処理中です。" });
+    return false;
+  }
 
+  flowRunning = true;
   runFlow(message.payload)
+    .finally(() => { flowRunning = false; })
     .then(() => sendResponse({ ok: true }))
     .catch((error) => sendResponse({ ok: false, error: error.message }));
 
@@ -37,11 +45,7 @@ async function runFlow(video) {
   status(`YouTube チャンネル名: 「${notebookTitle}」`);
   await openOrCreateNotebook(notebookTitle);
   await addYouTubeSource(video, notebookTitle);
-  await startMindMapV2(
-    notebookTitle,
-    video.title,
-    video.languageCode
-  );
+  await startMindMapV2(notebookTitle, video);
 
   status(`ノートブック「${notebookTitle}」でマインドマップの生成を開始しました`, "done");
 }
@@ -122,12 +126,20 @@ async function goHome() {
 
   if (homeLink) {
     await clickElement(homeLink);
-    await waitFor(() => !isNotebookPage(), 15000).catch(() => {});
+    await waitFor(
+      () => isNotebookHomeReady(),
+      30000,
+      "Gemini Notebook のホーム画面への切り替えが完了しませんでした。"
+    );
     return;
   }
 
   location.assign(NOTEBOOK_HOME_URL);
-  await waitFor(() => !isNotebookPage(), 15000).catch(() => {});
+  await waitFor(
+    () => isNotebookHomeReady(),
+    30000,
+    "Gemini Notebook のホーム画面への切り替えが完了しませんでした。"
+  );
 }
 
 async function findNotebookCard(name) {
@@ -184,15 +196,16 @@ async function findNotebookCard(name) {
 function isNotebookHomeReady() {
   if (isNotebookPage()) return false;
   if (document.readyState === "loading") return false;
+  if (!/^\/$/.test(location.pathname)) return false;
 
   const loading = [...document.querySelectorAll(
     "[aria-busy='true'], mat-progress-spinner, mat-spinner, [role='progressbar'], [class*='skeleton'], [class*='shimmer']"
   )].some((element) => !isHidden(element));
   if (loading) return false;
 
-  const notebookCards = document.querySelector(
+  const notebookCards = [...document.querySelectorAll(
     "a[href*='/notebook/'], .project-button-card, [class*='notebook-card']"
-  );
+  )].find((element) => !isHidden(element));
   if (notebookCards) return true;
 
   const emptyListContainer = document.querySelector(
@@ -282,20 +295,28 @@ function notebookLinkFromElement(element) {
 
 async function createNotebook(name) {
   snapshotState("before-create-notebook");
-  const createButton = await waitForClickableByText([
-    "新規作成",
-    "新しいノートブック",
-    "Create new",
-    "New notebook",
-    "Create"
-  ]);
+  await waitFor(
+    () => isNotebookHomeReady(),
+    30000,
+    "新規ノートブックを作成するホーム画面を確認できませんでした。"
+  );
+  const createButton = await waitFor(
+    () => findHomeCreateNotebookButton(),
+    15000,
+    "ホーム画面の「ノートブックを新規作成」が見つかりませんでした。"
+  ).catch((error) => {
+    debug("create:button-candidates", homeCreateNotebookCandidates().map(elementSummary));
+    throw error;
+  });
   const beforeUrl = location.href;
   debug("create:notebook-button", elementSummary(createButton));
   await markPendingNotebookCreation(name);
   await clickElement(createButton);
   snapshotState("after-create-button-click");
 
-  if (isNotebookPage()) {
+  const creationResult = await waitForNotebookCreationResult();
+  if (creationResult.kind === "notebook") {
+    await waitForNotebookOpen(beforeUrl, name);
     await ensureNotebookTitle(name);
     await clearPendingNotebookCreation();
     snapshotState("after-create-notebook-opened");
@@ -303,14 +324,7 @@ async function createNotebook(name) {
     return;
   }
 
-  const nameInput = await waitForInput([
-    'input[aria-label*="タイトル"]',
-    'input[aria-label*="名前"]',
-    'input[aria-label*="title" i]',
-    'input[aria-label*="name" i]',
-    "input",
-    "textarea"
-  ]);
+  const nameInput = creationResult.input;
 
   setAngularValue(nameInput, name);
   debug("create:name-input-filled", {
@@ -333,6 +347,68 @@ async function createNotebook(name) {
   await clearPendingNotebookCreation();
   snapshotState("after-create-notebook-opened");
   status(`ノートブック「${name}」を作成しました`);
+}
+
+function findHomeCreateNotebookButton() {
+  if (!/^\/$/.test(location.pathname)) return null;
+
+  const candidates = homeCreateNotebookCandidates();
+
+  const host = candidates.find((element) => {
+    const classes = String(element.className || "");
+    const text = normalize(
+      `${element.textContent || ""} ${element.getAttribute("aria-label") || ""}`
+    );
+    return /create-new-button|create-new-action-button/.test(classes) &&
+      /新規作成|新しいノートブック|create new|new notebook/.test(text);
+  }) || candidates.find((element) => {
+    const label = normalize(element.getAttribute("aria-label") ||
+      element.getAttribute("title") || element.textContent || element.shadowRoot?.textContent || "");
+    // ホーム上の操作要素だけを対象にする。検索や既存カードのタイトルには一致させない。
+    return /^(?:(?:add_2|add|plus)\s*)?(?:ノートブックを(?:新規)?作成|(?:新しい|新規)ノートブック(?:を作成)?|新規作成|create(?: new)? notebook|new notebook|create new)$/i.test(label);
+  });
+  if (!host) return null;
+  const nativeButtons = deepQuerySelectorAll("button", host);
+  return host.matches("button") ? host :
+    nativeButtons.length ? findNativeButton(host) : host;
+}
+
+function homeCreateNotebookCandidates() {
+  return deepQuerySelectorAll(
+    "button, [role='button'], nb-button, nb-icon-button, mat-card, .mat-mdc-card, .create-new-button, .create-new-action-button"
+  ).filter((element) => element.isConnected && !isHidden(element) && !isDisabled(element) &&
+    !closestAcrossShadowRoots(element, "[role='dialog'], .cdk-overlay-pane, .project-button-card, [class*='notebook-card']"));
+}
+
+function waitForNotebookCreationResult() {
+  return waitFor(() => {
+    if (isNotebookPage()) return { kind: "notebook" };
+    const input = findCreateNotebookNameInput();
+    return input ? { kind: "name-input", input } : null;
+  }, 30000, `新規ノートブックの作成画面を確認できませんでした。現在URL: ${location.href}`);
+}
+
+function findCreateNotebookNameInput() {
+  const dialogs = [...document.querySelectorAll(
+    "[role='dialog'], mat-dialog-container, .mat-mdc-dialog-container, .cdk-overlay-pane"
+  )].filter((element) => !isHidden(element));
+
+  for (const dialog of dialogs.reverse()) {
+    const dialogText = normalize(dialog.textContent || "");
+    if (!/ノートブック|notebook|新規作成|create new/.test(dialogText)) continue;
+
+    const input = [...dialog.querySelectorAll("input, textarea")]
+      .filter((element) => !isHidden(element) && !element.disabled && !element.readOnly)
+      .find((element) => {
+        const text = normalize(
+          `${element.getAttribute("aria-label") || ""} ${element.getAttribute("placeholder") || ""}`
+        );
+        return /タイトル|名前|title|name/.test(text) && !isSourceSearchInput(element);
+      });
+    if (input) return input;
+  }
+
+  return null;
 }
 
 async function ensureNotebookTitle(name) {
@@ -388,7 +464,7 @@ function findNotebookTitleInput() {
 
 async function addYouTubeSource(video, notebookName) {
   const url = video.url;
-  const videoId = normalize(new URL(url).searchParams.get("v") || "");
+  const videoId = new URL(url).searchParams.get("v") || "";
   const title = sourceMatchTitle(video);
   snapshotState("before-add-youtube-source");
   status(`ノートブック「${notebookName}」に YouTube ソースを追加しています`);
@@ -420,6 +496,11 @@ async function addYouTubeSource(video, notebookName) {
     const addSourceButton = await waitFor(() => findAddSourceButton(), 45000, `ノートブック「${notebookName}」で「ソースを追加」が見つかりませんでした。現在URL: ${location.href}`);
     debug("source:add-button", elementSummary(addSourceButton));
     await clickElement(addSourceButton);
+    await waitFor(
+      () => findSourceDialogRoot(),
+      10000,
+      "ソース追加ダイアログが表示されませんでした。"
+    );
     snapshotState("after-add-source-click");
   } else {
     debug("source:dialog-already-open", elementSummary(findSourceDialogRoot()));
@@ -443,6 +524,7 @@ async function addYouTubeSource(video, notebookName) {
   if (urlInput.value !== url) {
     throw new Error(`YouTube URL を入力欄へ反映できませんでした。入力欄の現在値: 「${urlInput.value || "空"}」`);
   }
+  status(`YouTube URL を入力欄へ反映しました（${urlInput.value.length}文字）`);
   pressEnter(urlInput);
 
   status("YouTube URL の確定ボタンを探しています");
@@ -539,7 +621,8 @@ function sourceDialogSearchRoots() {
 }
 
 function findYouTubeSourceOption() {
-  const root = findSourceDialogRoot() || document;
+  const root = findSourceDialogRoot();
+  if (!root) return null;
   const buttons = [...root.querySelectorAll("button, [role='button'], mat-card, .mat-mdc-card")]
     .filter((element) => !isHidden(element) && !isDisabled(element));
 
@@ -555,6 +638,7 @@ function findSourceUrlInput() {
   for (const root of roots) {
     const inputs = [...root.querySelectorAll("input, textarea")]
       .filter((element) => !isHidden(element) && !element.disabled && !element.readOnly && isInsideSourceDialogArea(element))
+      .filter(isTextEntryControl)
       .filter((element) => !isSourceSearchInput(element));
 
     const urlLike = inputs.find((element) => {
@@ -568,13 +652,27 @@ function findSourceUrlInput() {
   return null;
 }
 
+function isTextEntryControl(element) {
+  if (element.matches?.("textarea")) return true;
+  if (!element.matches?.("input")) return false;
+  const type = normalize(element.getAttribute("type") || "text");
+  return type === "text" || type === "url" || type === "search";
+}
+
 function isSourceSearchInput(element) {
   const text = normalize(`${element.className || ""} ${element.getAttribute("aria-label") || ""} ${element.getAttribute("placeholder") || ""}`);
   return /query-box|クエリ|検索|search|ソースを検出|detect/.test(text);
 }
 
-function findSourceSubmitButton() {
-  const buttons = sourceDialogSearchRoots()
+function findSourceSubmitButton(urlInput = findSourceUrlInput()) {
+  // The source panel also has a persistent "Add source" button. When the URL
+  // form is open, searching the whole document can mistake that launcher for
+  // the form's submit button. Anchor the search to the URL input's own overlay.
+  const inputDialog = urlInput?.closest(
+    "[role='dialog'], mat-dialog-container, .mat-mdc-dialog-container, .cdk-overlay-pane"
+  );
+  const searchRoots = inputDialog ? [inputDialog] : sourceDialogSearchRoots();
+  const buttons = searchRoots
     .flatMap((root) => [...root.querySelectorAll("button, [role='button']")])
     .filter((element, index, array) => array.indexOf(element) === index)
     .filter((element) => !isHidden(element))
@@ -582,11 +680,14 @@ function findSourceSubmitButton() {
 
   debug("source:submit-candidates", buttons.map(elementSummary));
 
-  const enabledButtons = buttons.filter((element) => !isDisabled(element));
+  const enabledButtons = buttons
+    .filter((element) => !isDisabled(element))
+    .filter((element) => !isAddSourceLauncher(element));
 
   return enabledButtons.find((button) => {
     const text = normalize(`${button.textContent || ""} ${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""}`);
-    return /挿入|追加|追加する|insert|submit|add source|add/.test(text) && !/ノートブック|notebook|作成|create/.test(text);
+    return /挿入|追加|追加する|insert|submit|add source|add/.test(text) &&
+      !/ノートブック|notebook|作成|create|ソースを追加|add sources?/.test(text);
   }) || enabledButtons.find((button) => {
     const text = normalize(button.textContent);
     const rect = button.getBoundingClientRect();
@@ -594,7 +695,17 @@ function findSourceSubmitButton() {
   }) || null;
 }
 
+function isAddSourceLauncher(element) {
+  const text = normalize(
+    `${element.textContent || ""} ${element.getAttribute("aria-label") || ""} ${element.getAttribute("title") || ""}`
+  );
+  return /ソースを追加|add sources?/.test(text);
+}
+
 async function clickSourceSubmitButton(button, url) {
+  if (isAddSourceLauncher(button)) {
+    throw new Error("URL確定ボタンではなく「ソースを追加」が選ばれたため、安全のため処理を中止しました。");
+  }
   await clickElement(button);
   const closedAfterFirstClick = await waitFor(
     () => !findUrlInputWithValue(url),
@@ -609,6 +720,9 @@ async function clickSourceSubmitButton(button, url) {
   });
 
   const retryButton = findSourceSubmitButton() || button;
+  if (isAddSourceLauncher(retryButton)) {
+    throw new Error("URL確定ボタンの再検出で「ソースを追加」が選ばれたため、安全のため処理を中止しました。");
+  }
   await clickElement(retryButton);
   await waitFor(
     () => !findUrlInputWithValue(url),
@@ -721,7 +835,9 @@ function findStudioOpenButton() {
   }) || null;
 }
 
-async function startMindMapV2(notebookName, videoTitle, videoLanguageCode) {
+async function startMindMapV2(notebookName, video) {
+  const videoTitle = video?.title || "";
+  const videoLanguageCode = video?.languageCode || "";
   snapshotState("before-start-mind-map-v2");
   status(`ノートブック「${notebookName}」で Studio のマインドマップを起動しています`);
   const studioTab = findStudioOpenButton();
@@ -742,6 +858,7 @@ async function startMindMapV2(notebookName, videoTitle, videoLanguageCode) {
 
   debug("mindmap:button", elementSummary(mindMapButton));
 
+  await prepareMindMapLibraryForCapture();
   // 作成ボタンが操作可能になった時点の一覧を基準として記録する。
   const artifactsBeforeList = findGeneratedMindMapArtifacts();
   const artifactsBefore = new Set(artifactsBeforeList);
@@ -751,9 +868,14 @@ async function startMindMapV2(notebookName, videoTitle, videoLanguageCode) {
     cards: mindMapsBefore.map(mindMapListEntryForLog)
   });
 
+  // 生成に使われるソースは生成開始時に確定するため、Studioを開いた後にも
+  // 対象1件だけの状態を作り直し、短時間維持されることを確認する。
+  await stabilizeOnlyVideoSourceSelection(video);
   await clickElementOnce(mindMapButton);
-  await completeMindMapTopicDialog(videoTitle, videoLanguageCode);
+  await completeMindMapTopicDialog(videoTitle, videoLanguageCode, video);
   await waitForMindMapStarted(artifactsBefore);
+  status("マインドマップ生成開始後のソース選択を対象動画だけに戻しています");
+  await selectOnlyVideoSource(video);
   const completedArtifact = await waitForNewMindMapCompleted(
     mindMapsBefore
   );
@@ -762,10 +884,32 @@ async function startMindMapV2(notebookName, videoTitle, videoLanguageCode) {
     mindMapsBefore,
     completedArtifact
   );
+  status("処理完了後のソース選択を対象動画だけに整えています");
+  await selectOnlyVideoSource(video);
   snapshotState("after-mind-map-click-v2");
 }
 
-async function completeMindMapTopicDialog(videoTitle, videoLanguageCode) {
+async function prepareMindMapLibraryForCapture() {
+  const library = await waitFor(
+    () => document.querySelector("artifact-library"),
+    10000,
+    "Studio のマインドマップ一覧を確認できませんでした。"
+  );
+  library.scrollIntoView?.({ block: "center", inline: "nearest" });
+
+  // 既存カードが仮想表示されている場合は、一覧を画面内へ移動して
+  // DOMへ展開されるまで待つ。既存カードが0件なら待機後に空一覧を使う。
+  await waitFor(
+    () => library.querySelector("artifact-library-item"),
+    3000
+  ).catch(() => null);
+  debug("mindmap:library-prepared", {
+    library: elementSummary(library),
+    cards: captureMindMapList().map(mindMapListEntryForLog)
+  });
+}
+
+async function completeMindMapTopicDialog(videoTitle, videoLanguageCode, video) {
   const topicInput = await waitFor(() => {
     return [...document.querySelectorAll("input, textarea")]
       .filter((element) => !isHidden(element) && !element.disabled && !element.readOnly)
@@ -826,8 +970,43 @@ async function completeMindMapTopicDialog(videoTitle, videoLanguageCode) {
     return buttons.sort((a, b) => cleanText(a.textContent).length - cleanText(b.textContent).length)[0] || null;
   }, 15000, "「希望するトピック」画面の生成ボタンが有効になりませんでした。");
 
+  // この確定操作の時点の選択が生成内容に使われる。ダイアログを開いた際に
+  // Gemini Notebookが全選択へ戻しても、確定前に必ず対象1件へ戻す。
+  await stabilizeOnlyVideoSourceSelection(video);
   debug("mindmap:topic-confirm-button", elementSummary(confirmButton));
   await clickElementOnce(confirmButton);
+  await closeMindMapTopicDialogIfOpen(topicInput, dialog);
+}
+
+async function closeMindMapTopicDialogIfOpen(topicInput, dialog) {
+  const closed = await waitFor(
+    () => !topicInput.isConnected || isHidden(topicInput),
+    5000
+  ).then(() => true).catch(() => false);
+  if (closed) return;
+
+  const closeButton = [...dialog.querySelectorAll("button, [role='button']")]
+    .filter((element) => !isHidden(element) && !isDisabled(element))
+    .find((element) => {
+      const text = normalize(
+        `${element.textContent || ""} ${element.getAttribute("aria-label") || ""} ${element.getAttribute("title") || ""}`
+      );
+      return /閉じる|close|cancel|キャンセル/.test(text);
+    });
+  if (!closeButton) {
+    debug("mindmap:topic-dialog-remained-without-close-button", {
+      input: elementSummary(topicInput),
+      dialog: elementSummary(dialog)
+    });
+    return;
+  }
+
+  debug("mindmap:close-topic-dialog", elementSummary(closeButton));
+  await clickElementOnce(closeButton);
+  await waitFor(
+    () => !topicInput.isConnected || isHidden(topicInput),
+    5000
+  ).catch(() => {});
 }
 
 function mindMapLanguageInstruction(videoTitle, videoLanguageCode) {
@@ -936,7 +1115,7 @@ async function waitForNewMindMapCompleted(mindMapsBefore) {
 
     // 経過時間ではなく、Gemini Notebook が示す完成状態だけで判定する。
     return candidate;
-  }, 240000, "新しいマインドマップの作成完了を確認できませんでした。既存の名前は変更していません。");
+  }, 120000, "2分以内に新しいマインドマップの作成完了を確認できませんでした。既存の名前は変更していません。");
 
   debug("mindmap:completed-artifact", elementSummary(completedArtifact));
   status("新しいマインドマップの作成完了を確認しました");
@@ -1029,28 +1208,32 @@ async function renameGeneratedMindMap(videoTitle, mindMapsBefore, artifact) {
     stableId: artifactStableId,
     artifact: elementSummary(currentArtifact)
   });
-  const menuButton = findArtifactMenuButton(currentArtifact);
-  if (!menuButton) {
-    throw new Error("作成されたマインドマップの操作メニューが見つかりませんでした。");
-  }
+  debug("mindmap:menu-candidates", artifactMenuDiagnostics(currentArtifact));
+  const menuButton = await waitFor(() => {
+    const latestArtifact = findMindMapArtifactByStableId(artifactStableId);
+    return latestArtifact && isMindMapArtifactCompleted(latestArtifact)
+      ? findArtifactMenuButton(latestArtifact)
+      : null;
+  }, 15000, "作成されたマインドマップの操作メニューが見つかりませんでした。");
+  debug("mindmap:artifact-menu-button", elementSummary(menuButton));
 
   await clickElementOnce(menuButton);
 
   const renameButton = await waitFor(() => {
-    return [...document.querySelectorAll(
-      "[role='menuitem'], button, [role='button'], mat-option"
-    )]
+    return deepQuerySelectorAll(
+      "[role='menuitem'], button, [role='button'], mat-option, nb-menu-item"
+    )
       .filter((element) => !isHidden(element) && !isDisabled(element))
       .find((element) => {
         const text = normalize(
           `${element.textContent || ""} ${element.getAttribute("aria-label") || ""} ${element.getAttribute("title") || ""}`
         );
-        return /名前を変更|名称変更|rename/.test(text);
+        return /名前.*変更|名称.*変更|タイトル.*(?:変更|編集)|rename|edit\s*(?:name|title)/.test(text);
       }) || null;
   }, 15000, "マインドマップの「名前を変更」が見つかりませんでした。");
 
   debug("mindmap:rename-menu-item", elementSummary(renameButton));
-  await clickElementOnce(renameButton);
+  await clickElementOnce(findNativeButton(renameButton) || renameButton);
 
   const nameInput = await waitFor(() => {
     const latestArtifact =
@@ -1070,49 +1253,38 @@ async function renameGeneratedMindMap(videoTitle, mindMapsBefore, artifact) {
     throw new Error("マインドマップ名に動画タイトルを入力できませんでした。");
   }
 
-  pressEnter(nameInput);
-  nameInput.blur?.();
-  nameInput.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
-
-  const autoCommitted = await waitFor(
-    () => isMindMapStableIdNamed(artifactStableId, videoTitle),
-    5000
-  )
-    .then(() => true)
-    .catch(() => false);
-  if (autoCommitted) {
-    debug("mindmap:rename-auto-committed", {
-      videoTitle,
-      input: elementSummary(nameInput)
+  // 入力欄がShadow DOM内にあっても所属する編集画面を保持する。
+  const dialog = closestAcrossShadowRoots(nameInput,
+    "[role='dialog'], mat-dialog-container, .mat-mdc-dialog-container, .cdk-overlay-pane"
+  ) || findMindMapArtifactByStableId(artifactStableId) || currentArtifact;
+  const saveButton = deepQuerySelectorAll("button, [role='button'], nb-button", dialog)
+    .filter((element) => !isHidden(element) && !isDisabled(element))
+    .find((element) => {
+      const text = normalize(element.textContent || element.getAttribute("aria-label") || "");
+      return /保存|変更|完了|save|rename|done/.test(text) &&
+        !/キャンセル|閉じる|戻る|cancel|close|back/.test(text);
     });
-    status(`マインドマップ名を「${videoTitle}」へ変更しました`);
-    return;
+  if (saveButton) {
+    await clickElementOnce(findNativeButton(saveButton) || saveButton);
+  } else {
+    pressEnter(nameInput);
+    nameInput.blur?.();
   }
-
-  const dialog = nameInput.closest(
-    "[role='dialog'], mat-dialog-container, .mat-mdc-dialog-container"
-  ) || nameInput.closest(".cdk-overlay-pane") ||
-    findMindMapArtifactByStableId(artifactStableId) ||
-    currentArtifact;
-  const saveButton = await waitFor(() => {
-    return [...dialog.querySelectorAll("button, [role='button']")]
-      .filter((element) => !isHidden(element) && !isDisabled(element))
-      .find((element) => {
-        const text = normalize(
-          `${element.textContent || ""} ${element.getAttribute("aria-label") || ""} ${element.getAttribute("title") || ""}`
-        );
-        return /保存|変更|完了|save|rename|done/.test(text) &&
-          !/キャンセル|閉じる|戻る|cancel|close|back/.test(text);
-      }) || null;
-  }, 15000, "マインドマップ名を保存するボタンが見つかりませんでした。");
-
-  debug("mindmap:rename-save-button", elementSummary(saveButton));
-  await clickElementOnce(saveButton);
-  await waitFor(
-    () => isMindMapStableIdNamed(artifactStableId, videoTitle),
-    15000,
-    "マインドマップ名が動画タイトルへ変更されたことを確認できませんでした。");
+  await waitFor(() => {
+    const editorClosed = nameInput.isConnected === false || isHidden(nameInput);
+    return editorClosed && isMindMapStableIdNamed(artifactStableId, videoTitle);
+  }, 15000, "マインドマップ名の保存完了を確認できませんでした。");
   status(`マインドマップ名を「${videoTitle}」へ変更しました`);
+}
+
+function closestAcrossShadowRoots(element, selector) {
+  let current = element;
+  while (current) {
+    const match = current.closest?.(selector);
+    if (match) return match;
+    current = current.getRootNode?.().host;
+  }
+  return null;
 }
 
 function findMindMapArtifactByStableId(stableId) {
@@ -1162,19 +1334,20 @@ function isMindMapStableIdNamed(stableId, videoTitle) {
   const artifact = findMindMapArtifactByStableId(stableId);
   if (!artifact) return false;
   const title = artifact.querySelector?.(".artifact-title");
-  const actualTitle =
-    typeof title?.value === "string" ? title.value : title?.textContent;
+  if (!title || title.matches?.("input, textarea, [contenteditable='true']") ||
+    title.querySelector?.("input, textarea, [contenteditable='true']")) return false;
+  const actualTitle = title.textContent;
   return normalize(actualTitle || "") ===
     normalize(videoTitle);
 }
 
 function findGeneratedMindMapArtifacts() {
+  const directItems = [...document.querySelectorAll("artifact-library-item")]
+    .filter((element) => !isHidden(element))
+    .filter(isMindMapArtifactCandidate);
   const primaryContents = [...document.querySelectorAll(".artifact-primary-content")]
     .filter((element) => !isHidden(element))
-    .filter((element) => {
-      const text = normalize(element.textContent || "");
-      return /mind\s*map|マインドマップ|flowchart/.test(text);
-    });
+    .filter(isMindMapArtifactCandidate);
 
   const cards = primaryContents.map((primaryContent) => {
     const item = primaryContent.closest?.("artifact-library-item");
@@ -1189,7 +1362,17 @@ function findGeneratedMindMapArtifacts() {
     return primaryContent;
   });
 
-  return cards.filter((element, index, array) => array.indexOf(element) === index);
+  return [...directItems, ...cards]
+    .filter((element, index, array) => array.indexOf(element) === index);
+}
+
+function isMindMapArtifactCandidate(element) {
+  const text = normalize(
+    `${element?.textContent || ""} ` +
+    `${element?.getAttribute?.("aria-label") || ""} ` +
+    `${element?.querySelector?.(".artifact-icon")?.textContent || ""}`
+  );
+  return /mind\s*map|マインドマップ|flowchart/.test(text);
 }
 
 function findMindMapArtifactKeys() {
@@ -1212,11 +1395,68 @@ function countArtifactKeys(keys) {
 }
 
 function findArtifactMenuButton(artifact) {
-  return [...artifact.querySelectorAll(
-    "button.artifact-more-button, [role='button'].artifact-more-button"
-  )]
-    .filter((element) => !isHidden(element) && !isDisabled(element))
-    .find((element) => !element.closest(".source-panel, [class*='source-panel']")) || null;
+  if (!artifact || artifact.isConnected === false || isHidden(artifact)) return null;
+  // .artifact-more-button は nb-icon-button ホストに付く場合もある。
+  // ホストをクリックしても内側の button のリスナーには届かないため、
+  // light DOM / open Shadow DOM の実ボタンを優先して一度だけ押す。
+  const hosts = [...artifact.querySelectorAll(".artifact-more-button")]
+    .filter((host) => isArtifactMenuUsable(host) &&
+      host.closest("artifact-library-item") === artifact &&
+      !host.closest(".source-panel, [class*='source-panel']"));
+  for (const host of hosts) {
+    if (host.matches?.("button")) return host;
+    const buttons = deepQuerySelectorAll("button", host);
+    if (!buttons.length) return host;
+    const button = buttons.find(isArtifactMenuUsable);
+    if (button) return button;
+  }
+  return null;
+}
+
+function isArtifactMenuUsable(element) {
+  const style = getComputedStyle(element);
+  const rect = element.getBoundingClientRect();
+  // ホバー前の visibility:hidden は native click を妨げない。
+  return element.isConnected !== false && !isDisabled(element) &&
+    style.display !== "none" && rect.width > 0 && rect.height > 0;
+}
+
+function findNativeButton(element) {
+  if (element.matches?.("button")) return element;
+  return deepQuerySelectorAll("button", element)
+    .find((button) => !isHidden(button) && !isDisabled(button)) || null;
+}
+
+function deepQuerySelectorAll(selector, root = document) {
+  const results = new Set();
+  const visited = new Set();
+  function visit(searchRoot) {
+    if (!searchRoot || visited.has(searchRoot)) return;
+    visited.add(searchRoot);
+    for (const element of searchRoot.querySelectorAll?.(selector) || []) {
+      results.add(element);
+    }
+    visit(searchRoot.shadowRoot);
+    for (const element of searchRoot.querySelectorAll?.("*") || []) {
+      visit(element.shadowRoot);
+    }
+  }
+  visit(root);
+  return [...results];
+}
+
+function artifactMenuDiagnostics(artifact) {
+  return [...artifact.querySelectorAll(".artifact-more-button")].map((host) => ({
+    host: elementSummary(host),
+    display: getComputedStyle(host).display,
+    visibility: getComputedStyle(host).visibility,
+    hasShadowRoot: Boolean(host.shadowRoot),
+    buttons: deepQuerySelectorAll("button", host).map((button) => ({
+      element: elementSummary(button),
+      display: getComputedStyle(button).display,
+      visibility: getComputedStyle(button).visibility
+    }))
+  }));
 }
 
 function mindMapArtifactKey(artifact) {
@@ -1231,16 +1471,16 @@ function mindMapArtifactKey(artifact) {
 
 function findMindMapRenameControl(artifact) {
   const overlayRoots = [
-    ...document.querySelectorAll(
+    ...deepQuerySelectorAll(
       "[role='dialog'], mat-dialog-container, .mat-mdc-dialog-container, .cdk-overlay-pane"
     )
   ].filter((element) => !isHidden(element));
   const roots = [...overlayRoots.reverse(), artifact];
 
   for (const root of roots) {
-    const controls = [...root.querySelectorAll(
-      "input, textarea, [contenteditable='true']"
-    )].filter((element) => {
+    const controls = deepQuerySelectorAll(
+      "input, textarea, [contenteditable='true']", root
+    ).filter((element) => {
       if (isHidden(element) || element.disabled || element.readOnly) return false;
       if (isSourceSearchInput(element)) return false;
       const text = normalize(
@@ -1481,15 +1721,42 @@ function findSelectAllSourcesControl() {
 }
 
 function sourceSelectionMatchesVideo(entry, videoId, title) {
+  const identity = sourceIdentity(entry);
+  if (identity.videoIds.length > 0) return identity.videoIds.includes(videoId);
   const titleKey = sourceTitleMatchKey(title);
-  return (
-    (videoId && entry.text.includes(videoId)) ||
-    (titleKey && entry.text.includes(titleKey))
-  );
+  return Boolean(titleKey && sourceTitleMatchKey(identity.title) === titleKey);
 }
 
 function sourceTitleMatchKey(title) {
-  return normalize(title).slice(0, 24);
+  return normalize(title);
+}
+
+function sourceIdentity(entry) {
+  const item = entry.item;
+  const links = [...(item?.querySelectorAll?.("a[href]") || [])];
+  const rawText = `${item?.textContent || ""} ${entry.control?.getAttribute?.("aria-label") || ""}`;
+  const urls = [...links.map((link) => link.href || link.getAttribute("href")),
+    ...(rawText.match(/https?:\/\/[^\s<>"']+/g) || [])];
+  const videoIds = [];
+  for (const value of urls) {
+    try {
+      const url = new URL(value);
+      const id = /^(www\.)?youtube\.com$/.test(url.hostname)
+        ? url.searchParams.get("v")
+        : url.hostname === "youtu.be" ? url.pathname.slice(1) : "";
+      if (id) videoIds.push(id);
+    } catch { /* URL以外の属性は照合に使わない。 */ }
+  }
+  const titleElement = item?.querySelector?.(
+    ".source-title, .source-item-title, [class*='source-title'], [class*='source-name']"
+  );
+  const checkboxLabel = entry.control?.getAttribute?.("aria-label") ||
+    entry.control?.querySelector?.("input[type='checkbox']")?.getAttribute?.("aria-label");
+  const title = titleElement?.getAttribute?.("title") || titleElement?.textContent ||
+    checkboxLabel || cleanText(item?.textContent || "")
+      .replace(/^(?:video_youtube|youtube|description)\s+/i, "")
+      .replace(/\s+more_vert$/i, "");
+  return { videoIds, title: cleanText(title) };
 }
 
 function findProcessedVideoSourceEntry(videoId, title) {
@@ -1509,8 +1776,8 @@ function findProcessedVideoSourceEntry(videoId, title) {
 
   // 新規追加直後のURLだけの一時行ではなく、動画タイトルへ解決された
   // 操作可能な正式ソース行になったことを完了状態として使用する。
-  const titleKey = sourceTitleMatchKey(title);
-  if (titleKey && !entry.text.includes(titleKey)) {
+  const resolvedTitle = sourceIdentity(entry).title;
+  if (!resolvedTitle || /^https?:\/\//i.test(resolvedTitle)) {
     return null;
   }
 
@@ -1585,7 +1852,7 @@ async function revealVideoSourceInVirtualList(videoId, title) {
 }
 
 async function waitForVideoSourceSelectable(video) {
-  const videoId = normalize(new URL(video.url).searchParams.get("v") || "");
+  const videoId = new URL(video.url).searchParams.get("v") || "";
   const title = sourceMatchTitle(video);
   status("追加した動画のソース処理完了を待っています");
 
@@ -1629,7 +1896,7 @@ async function waitForVideoSourceSelectable(video) {
 }
 
 async function selectOnlyVideoSource(video) {
-  const videoId = normalize(new URL(video.url).searchParams.get("v") || "");
+  const videoId = new URL(video.url).searchParams.get("v") || "";
   const title = sourceMatchTitle(video);
   const items = findSourceSelectionItems();
   const matches = items.filter((entry) =>
@@ -1659,6 +1926,7 @@ async function selectOnlyVideoSource(video) {
     isSourceControlSelected(control)
   );
   let usedSelectAll = false;
+  let bulkClearConfirmed = false;
   if (
     alreadySelected.length !== 1 ||
     !sourceSelectionMatchesVideo(alreadySelected[0], videoId, title)
@@ -1682,9 +1950,11 @@ async function selectOnlyVideoSource(video) {
         selectAllControl,
         videoId,
         title,
-        "「すべて選択」で選択状態を切り替えられませんでした。"
+        "「すべて選択」で選択状態を切り替えられませんでした。",
+        true
       );
       selectionConfirmed = state.onlyTargetSelected;
+      bulkClearConfirmed = state.bulkClearConfirmed;
     }
 
     currentItems = findSourceSelectionItems();
@@ -1696,10 +1966,16 @@ async function selectOnlyVideoSource(video) {
         findSelectAllSourcesControl(),
         videoId,
         title,
-        "すべてのソースを一括解除できませんでした。"
+        "すべてのソースを一括解除できませんでした。",
+        false
       );
       selectionConfirmed = state.onlyTargetSelected;
-      if (!selectionConfirmed && state.selectedCount !== 0) {
+      bulkClearConfirmed = state.bulkClearConfirmed;
+      if (
+        !selectionConfirmed &&
+        !bulkClearConfirmed &&
+        state.selectedCount !== 0
+      ) {
         throw new Error("すべてのソースを一括解除できませんでした。");
       }
     }
@@ -1718,7 +1994,12 @@ async function selectOnlyVideoSource(video) {
         const currentMatches = findSourceSelectionItems().filter((entry) =>
           sourceSelectionMatchesVideo(entry, videoId, title)
         );
-        return currentMatches.length > 0 ? currentMatches[0] : null;
+        if (currentMatches.length === 0) return null;
+        const match = currentMatches[0];
+        if (bulkClearConfirmed && isSourceControlSelected(match.control)) {
+          return null;
+        }
+        return match;
       }, 6000).catch(() => null);
       if (!currentMatch) continue;
 
@@ -1733,22 +2014,49 @@ async function selectOnlyVideoSource(video) {
         const selectedNow = refreshed.filter(({ control }) =>
           isSourceControlSelected(control)
         );
+        const selectedTarget = refreshed.find((entry) =>
+          sourceSelectionMatchesVideo(entry, videoId, title) &&
+          isSourceControlSelected(entry.control)
+        );
         const correctlySelected =
           selectedNow.length === 1 &&
           sourceSelectionMatchesVideo(selectedNow[0], videoId, title);
-        return correctlySelected || null;
+        const globallyClearedAndTargetSelected =
+          bulkClearConfirmed &&
+          Boolean(selectedTarget) &&
+          !isSourceControlSelected(findSelectAllSourcesControl());
+        return correctlySelected || globallyClearedAndTargetSelected || null;
       }, 6000).then(() => true).catch(() => false);
 
       if (!selectionConfirmed) {
+        const retryItems = findSourceSelectionItems();
+        const retrySelectedCount = retryItems.filter(({ control }) =>
+          isSourceControlSelected(control)
+        ).length;
         debug("source:target-selection-retry", {
           attempt: attempt + 1,
-          items: findSourceSelectionItems().map(({ control, item, text }) => ({
+          selectedCount: retrySelectedCount,
+          items: retryItems.map(({ control, item, text }) => ({
             selected: isSourceControlSelected(control),
             text: text.slice(0, 300),
             control: elementSummary(control),
             item: elementSummary(item)
           }))
         });
+
+        if (
+          retrySelectedCount > 1 ||
+          isSourceSelectAllVisuallySelected(findSelectAllSourcesControl())
+        ) {
+          const clearedState = await toggleSelectAllAndWait(
+            findSelectAllSourcesControl(),
+            videoId,
+            title,
+            "再試行時にすべてのソースを一括解除できませんでした。",
+            false
+          );
+          bulkClearConfirmed = clearedState.bulkClearConfirmed;
+        }
       }
     }
 
@@ -1757,22 +2065,27 @@ async function selectOnlyVideoSource(video) {
     }
   }
 
-  const selected = findSourceSelectionItems()
+  const finalItems = findSourceSelectionItems();
+  const selected = finalItems
     .filter(({ control }) => isSourceControlSelected(control));
-  if (selected.length !== 1) {
+  const selectedTarget = finalItems.find((entry) =>
+    sourceSelectionMatchesVideo(entry, videoId, title) &&
+    isSourceControlSelected(entry.control)
+  );
+  const selectionIsSafe =
+    (selected.length === 1 && selectedTarget === selected[0]) ||
+    (
+      bulkClearConfirmed &&
+      Boolean(selectedTarget) &&
+      !isSourceControlSelected(findSelectAllSourcesControl())
+    );
+  if (!selectionIsSafe) {
     throw new Error(
       "対象動画だけを選択した状態にできなかったため、マインドマップ作成を中止しました。"
     );
   }
 
-  const selectedText = selected[0].text;
-  const titleKey = sourceTitleMatchKey(title);
-  if (
-    !(
-      (videoId && selectedText.includes(videoId)) ||
-      (titleKey && selectedText.includes(titleKey))
-    )
-  ) {
+  if (!sourceSelectionMatchesVideo(selectedTarget, videoId, title)) {
     throw new Error(
       "選択されたソースが対象動画と一致しないため、マインドマップ作成を中止しました。"
     );
@@ -1783,6 +2096,18 @@ async function selectOnlyVideoSource(video) {
       ? "「すべて選択」で一括解除し、対象動画のソースだけを選択しました"
       : "対象動画のソースだけが既に選択されています"
   );
+}
+
+async function stabilizeOnlyVideoSourceSelection(video) {
+  await selectOnlyVideoSource(video);
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  await selectOnlyVideoSource(video);
+  debug("source:selection-stable-before-generation", {
+    selected: findSourceSelectionItems()
+      .filter(({ control }) => isSourceControlSelected(control))
+      .map(({ text }) => text.slice(0, 300)),
+    selectAll: elementSummary(findSelectAllSourcesControl())
+  });
 }
 
 function sourceMatchTitle(video) {
@@ -1812,25 +2137,62 @@ async function toggleSelectAllAndWait(
   selectAllControl,
   videoId,
   title,
-  timeoutMessage
+  timeoutMessage,
+  expectedSelected = null
 ) {
   if (!selectAllControl) {
     throw new Error(
       "「すべて選択」のチェックボックスが見つからないため、ソース選択を中止しました。"
     );
   }
-  const beforeState = sourceSelectionState(videoId, title);
-  const beforeSignature = sourceSelectionSignature(beforeState);
-  await clickElementOnce(sourceCheckboxClickTarget(selectAllControl));
-  return waitFor(() => {
-    const state = sourceSelectionState(videoId, title);
-    if (sourceSelectionSignature(state) === beforeSignature) {
-      return null;
+  const desiredSelected = expectedSelected == null
+    ? !isSourceSelectAllVisuallySelected(selectAllControl)
+    : expectedSelected;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const currentControl = findSelectAllSourcesControl();
+    if (!currentControl) break;
+
+    if (isSourceSelectAllVisuallySelected(currentControl) !== desiredSelected) {
+      await clickElementOnce(sourceCheckboxClickTarget(currentControl));
     }
-    return state.onlyTargetSelected || state.uniformSelection
-      ? state
-      : null;
-  }, 10000, timeoutMessage);
+
+    const confirmed = await waitFor(() => {
+      const state = sourceSelectionState(videoId, title);
+      const refreshedControl = findSelectAllSourcesControl();
+      if (!refreshedControl) return null;
+      return isSourceSelectAllVisuallySelected(refreshedControl) === desiredSelected
+        ? state
+        : null;
+    }, 4000).catch(() => null);
+    if (confirmed) {
+      return {
+        ...confirmed,
+        selectAllChanged: true,
+        selectAllIsSelected: desiredSelected,
+        bulkClearConfirmed: !desiredSelected
+      };
+    }
+
+    debug("source:select-all-state-reverted", {
+      attempt: attempt + 1,
+      desiredSelected,
+      control: elementSummary(findSelectAllSourcesControl())
+    });
+  }
+
+  throw new Error(timeoutMessage);
+}
+
+function isSourceSelectAllVisuallySelected(control) {
+  if (!control) return false;
+  const input = control.matches?.("input[type='checkbox']")
+    ? control
+    : control.querySelector?.("input[type='checkbox']");
+  return Boolean(
+    input?.checked ||
+    input?.classList?.contains("mdc-checkbox--selected")
+  );
 }
 
 function sourceSelectionSignature(state) {
@@ -2240,10 +2602,15 @@ function debug(label, data = undefined) {
 }
 
 function storeDebug(entry) {
-  chrome.storage.local.get({ debugLog: [] }).then(({ debugLog }) => {
-    const nextLog = [...debugLog, entry].slice(-200);
-    return chrome.storage.local.set({ debugLog: nextLog });
-  }).catch(() => {});
+  // Serialize storage updates. Concurrent read-modify-write calls used to
+  // overwrite one another and drop the URL-input diagnostics we needed most.
+  debugStoreQueue = debugStoreQueue
+    .then(() => chrome.storage.local.get({ debugLog: [] }))
+    .then(({ debugLog }) => {
+      const nextLog = [...debugLog, entry].slice(-200);
+      return chrome.storage.local.set({ debugLog: nextLog });
+    })
+    .catch(() => {});
 }
 
 function cloneForLog(data) {
@@ -2337,6 +2704,7 @@ function waitFor(predicate, timeout = 30000, timeoutMessage = "タイムアウ�
     let settled = false;
     let observer = null;
     let timeoutId = null;
+    const observedRoots = new Set();
     const documentEvents = [
       "input",
       "change",
@@ -2368,6 +2736,7 @@ function waitFor(predicate, timeout = 30000, timeoutMessage = "タイムアウ�
     const check = () => {
       if (settled) return;
       try {
+        observeRoots(document.documentElement || document.body);
         const value = predicate();
         if (value) {
           finish(value);
@@ -2377,16 +2746,19 @@ function waitFor(predicate, timeout = 30000, timeoutMessage = "タイムアウ�
       }
     };
 
-    const observedRoot = document.documentElement || document.body;
-    if (observedRoot) {
-      observer = new MutationObserver(check);
-      observer.observe(observedRoot, {
-        subtree: true,
-        childList: true,
-        attributes: true,
-        characterData: true
-      });
-    }
+    const observeRoots = (root) => {
+      if (!root || !observer) return;
+      if (!observedRoots.has(root)) {
+        observer.observe(root, { subtree: true, childList: true, attributes: true, characterData: true });
+        observedRoots.add(root);
+      }
+      if (root.shadowRoot) observeRoots(root.shadowRoot);
+      for (const element of root.querySelectorAll?.("*") || []) {
+        if (element.shadowRoot) observeRoots(element.shadowRoot);
+      }
+    };
+    observer = new MutationObserver(check);
+    observeRoots(document.documentElement || document.body);
 
     for (const eventName of documentEvents) {
       document.addEventListener(eventName, check, true);

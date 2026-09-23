@@ -14,6 +14,8 @@ const ui = {
   debugCopyStatus: document.querySelector("#debug-copy-status")
 };
 
+const DEBUG_STORAGE_DEFAULTS = { flowStatus: [], debugLog: [] };
+
 let activeTab;
 let videoInfo;
 
@@ -40,6 +42,8 @@ async function init() {
     videoInfo = await sendMessageToTab(activeTab.id, { type: "YT_GET_VIDEO_INFO" });
     renderVideoInfo(videoInfo);
     await restoreProgress({ clearCompleted: true });
+    const state = await chrome.runtime.sendMessage({ type: "GET_FLOW_STATE" });
+    if (state?.ok) setBusy(state.running);
   } catch (error) {
     showPanelError("動画情報を取得できませんでした。ページを再読み込みしてからもう一度お試しください。");
     console.error(error);
@@ -60,6 +64,11 @@ ui.addButton.addEventListener("click", async () => {
     });
 
     if (!response?.ok) {
+      if (response?.busy) {
+        addProgress(response.error, "info");
+        setBusy(true);
+        return;
+      }
       throw new Error(response?.error || "Gemini Notebook への追加に失敗しました。");
     }
   } catch (error) {
@@ -144,41 +153,49 @@ function renderProgress(entries) {
 }
 
 async function copyDebugLog() {
-  const data = await getDebugPayload();
-  const text = JSON.stringify(data, null, 2);
-
-  try {
-    await navigator.clipboard.writeText(text);
-    setDebugStatus(`コピーしました: 進捗 ${data.flowStatus.length} 件 / 詳細 ${data.debugLog.length} 件`);
-  } catch {
-    setDebugStatus("コピーできませんでした。JSONファイル保存を使ってください。");
-  }
+  await runDebugAction(
+    async (data) => navigator.clipboard.writeText(JSON.stringify(data, null, 2)),
+    (data) => `コピーしました: ${debugEntrySummary(data)}`,
+    () => "コピーできませんでした。JSONファイル保存を使ってください。"
+  );
 }
 
 async function downloadDebugLog() {
+  await runDebugAction(
+    async (data) => {
+      const response = await chrome.runtime.sendMessage({
+        type: "DOWNLOAD_DEBUG_LOG",
+        payload: data
+      });
+      if (!response?.ok) {
+        throw new Error(response?.error || "JSONファイルを保存できませんでした。");
+      }
+    },
+    (data) => `保存先を選ぶ画面を開きました: ${debugEntrySummary(data)}`,
+    (error) => error.message || "JSONファイルを保存できませんでした。"
+  );
+}
+
+async function runDebugAction(action, successMessage, errorMessage) {
   const data = await getDebugPayload();
-
   try {
-    const response = await chrome.runtime.sendMessage({
-      type: "DOWNLOAD_DEBUG_LOG",
-      payload: data
-    });
-
-    if (!response?.ok) {
-      throw new Error(response?.error || "JSONファイルを保存できませんでした。");
-    }
-
-    setDebugStatus(`保存先を選ぶ画面を開きました: 進捗 ${data.flowStatus.length} 件 / 詳細 ${data.debugLog.length} 件`);
+    await action(data);
+    setDebugStatus(successMessage(data));
   } catch (error) {
-    setDebugStatus(error.message || "JSONファイルを保存できませんでした。");
+    setDebugStatus(errorMessage(error));
   }
 }
 
+function debugEntrySummary(data) {
+  return `進捗 ${data.flowStatus.length} 件 / 詳細 ${data.debugLog.length} 件`;
+}
+
 async function getDebugPayload() {
-  const data = await chrome.storage.local.get({ flowStatus: [], debugLog: [] });
+  const data = await chrome.storage.local.get(DEBUG_STORAGE_DEFAULTS);
   return {
     exportedAt: new Date().toISOString(),
     extension: "YouTube to Gemini Notebook Mind Map",
+    extensionVersion: chrome.runtime.getManifest().version,
     page: {
       activeTabUrl: activeTab?.url || "",
       videoTitle: videoInfo?.title || "",

@@ -10,21 +10,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function getVideoInfo() {
-  await waitForCurrentVideoMetadata();
-  const url = canonicalVideoUrl();
-  const videoId = new URL(url).searchParams.get("v");
-  const title = getTitle();
-  const sourceTitle = await getCanonicalSourceTitle(url, title);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await waitForCurrentVideoMetadata();
+    const url = canonicalVideoUrl();
+    const videoId = new URL(url).searchParams.get("v");
+    const title = getTitle();
+    const channelName = getChannelName();
+    const captions = hasCaptions();
+    const languageCode = getVideoLanguageCode();
+    const sourceTitle = await getCanonicalSourceTitle(url, title);
+    if (canonicalVideoUrl() !== url || !isCurrentVideoMetadataReady()) continue;
 
-  return {
-    title,
-    sourceTitle,
-    channelName: getChannelName(),
-    url,
-    thumbnailUrl: videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : getMeta("og:image"),
-    hasCaptions: hasCaptions(),
-    languageCode: getVideoLanguageCode()
-  };
+    return {
+      title,
+      sourceTitle,
+      channelName,
+      url,
+      thumbnailUrl: videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : getMeta("og:image"),
+      hasCaptions: captions,
+      languageCode
+    };
+  }
+  throw new Error("動画情報の取得中に動画が切り替わりました。動画ページで再度お試しください。");
 }
 
 async function getCanonicalSourceTitle(url, fallbackTitle) {
@@ -118,18 +125,37 @@ function getPlayerResponse() {
     if (start === -1) continue;
 
     const jsonStart = start + marker.length;
-    const jsonEnd = text.indexOf(";</script>", jsonStart) === -1
-      ? text.indexOf(";", jsonStart)
-      : text.indexOf(";</script>", jsonStart);
-
     try {
-      return JSON.parse(text.slice(jsonStart, jsonEnd));
+      return JSON.parse(extractJsonObject(text, jsonStart));
     } catch {
-      return null;
+      // 他のscript要素に有効なレスポンスがある場合は続けて探す。
     }
   }
 
   return null;
+}
+
+function extractJsonObject(text, start) {
+  while (/\s/.test(text[start] || "") && start < text.length) start += 1;
+  if (text[start] !== "{") throw new Error("Player response is not an object");
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+    } else if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}" && --depth === 0) {
+      return text.slice(start, index + 1);
+    }
+  }
+  throw new Error("Incomplete player response");
 }
 
 function getCurrentPlayerResponse() {

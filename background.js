@@ -3,7 +3,9 @@ const NOTEBOOK_URL_PATTERNS = [
   "https://notebook.google.com/*",
   "https://notebooklm.google.com/*"
 ];
-const NOTEBOOK_CONTENT_VERSION = "2026-07-29-gemini-notebook-v40";
+const NOTEBOOK_CONTENT_VERSION = "2026-09-22-gemini-notebook-v57";
+const EXTENSION_VERSION = chrome.runtime.getManifest?.()?.version || "0.2.8";
+let flowRunning = false;
 
 chrome.runtime.onInstalled.addListener(() => {
   clearLogs();
@@ -11,27 +13,59 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "START_NOTEBOOKLM_FLOW") {
-    runNotebookLmFlow(message.payload)
-      .then(() => sendResponse({ ok: true }))
-      .catch((error) => {
-        notify("error", error.message || "Gemini Notebook の自動操作に失敗しました。");
-        sendResponse({ ok: false, error: error.message });
-      });
-    return true;
+    if (flowRunning) {
+      sendResponse({ ok: false, busy: true, error: "別の動画を処理中です。完了してから再度お試しください。" });
+      return false;
+    }
+    flowRunning = true;
+    return respondAsync(
+      runNotebookLmFlow(message.payload).finally(() => { flowRunning = false; }),
+      sendResponse,
+      () => ({ ok: true }),
+      (error) => {
+        if (!error.busy) notify("error", error.message || "Gemini Notebook の自動操作に失敗しました。");
+        return { ...errorResponse(error), busy: Boolean(error.busy) };
+      }
+    );
+  }
+
+  if (message?.type === "GET_FLOW_STATE") {
+    return respondAsync(
+      getNotebookFlowState(), sendResponse,
+      (running) => ({ ok: true, running }), errorResponse
+    );
   }
 
   if (message?.type === "DOWNLOAD_DEBUG_LOG") {
-    downloadDebugLog(message.payload)
-      .then((downloadId) => sendResponse({ ok: true, downloadId }))
-      .catch((error) => sendResponse({ ok: false, error: error.message }));
-    return true;
+    return respondAsync(
+      downloadDebugLog(message.payload),
+      sendResponse,
+      (downloadId) => ({ ok: true, downloadId }),
+      errorResponse
+    );
   }
 
   return false;
 });
 
+function respondAsync(operation, sendResponse, onSuccess, onError) {
+  operation.then(
+    (value) => sendResponse(onSuccess(value)),
+    (error) => sendResponse(onError(error))
+  );
+  return true;
+}
+
+function errorResponse(error) {
+  return { ok: false, error: error?.message || String(error) };
+}
+
 async function runNotebookLmFlow(video) {
   validateVideo(video);
+  // Worker再起動後や応答タイムアウト後も、ページ側の実行を上書きしない。
+  if (await isNotebookPageRunning()) {
+    throw Object.assign(new Error("別の動画を処理中です。完了してから再度お試しください。"), { busy: true });
+  }
   await clearLogs();
   await chrome.storage.local.set({ pendingNotebookCreationName: "" });
   notify("info", "Gemini Notebook タブを開いて前面にしました");
@@ -55,8 +89,26 @@ async function runNotebookLmFlow(video) {
 
   await ensureNotebookContentScript(tab.id);
 
+  notify("info", `拡張機能 ${EXTENSION_VERSION} / 操作スクリプト ${NOTEBOOK_CONTENT_VERSION} を確認しました`);
   notify("info", "Gemini Notebook の自動操作を開始します");
   await runNotebookFlowAcrossNavigations(tab.id, video);
+}
+
+async function isNotebookPageRunning() {
+  const tabs = await chrome.tabs.query({ url: NOTEBOOK_URL_PATTERNS });
+  const states = await Promise.all(tabs.map(async (tab) => {
+    try {
+      const response = await sendMessageToTabWithTimeout(tab.id, { type: "NLM_PING" }, 2500);
+      return Boolean(response?.running);
+    } catch {
+      return false;
+    }
+  }));
+  return states.some(Boolean);
+}
+
+async function getNotebookFlowState() {
+  return flowRunning || await isNotebookPageRunning();
 }
 
 function validateVideo(video) {
@@ -115,10 +167,10 @@ async function runNotebookFlowAcrossNavigations(tabId, video) {
         payload: video
       }, 300000);
       if (!result?.ok) {
-        throw new Error(
+        throw Object.assign(new Error(
           result?.error ||
           "Gemini Notebook の画面操作に失敗しました。"
-        );
+        ), { busy: Boolean(result?.busy) });
       }
       return;
     } catch (error) {
